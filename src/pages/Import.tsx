@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { pdfjs } from "react-pdf";
+import { PDFDocument } from "pdf-lib";
 import { CheckCircle2, FileUp, Loader2 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 import type { Material, MaterialType, Unit } from "../lib/types";
@@ -14,26 +15,31 @@ const EXPECTED: { type: MaterialType; title: string; hint: string }[] = [
   { type: "exercises", title: "60 exercícios", hint: "60 exercícios" },
 ];
 
-/** Nº de páginas por unidade, por tipo de material. */
-const PAGES_PER_UNIT: Record<MaterialType, number> = {
-  mindmap: 1,
-  phrases: 1,
-  phrasal_verbs: 1,
-  pronunciation: 1,
-  exercises: 1,
-};
+/** Limite do Supabase Free é 50 MB; dividimos acima de 40 MB por segurança. */
+const MAX_CHUNK_BYTES = 40 * 1024 * 1024;
 
-const LEVEL_BY_TYPE: Record<MaterialType, string> = {
-  mindmap: "intermediate",
-  phrases: "intermediate",
-  phrasal_verbs: "intermediate",
-  pronunciation: "intermediate",
-  exercises: "intermediate",
-};
+async function splitPdf(buf: ArrayBuffer, parts: number): Promise<Uint8Array[]> {
+  const src = await PDFDocument.load(buf, { ignoreEncryption: true });
+  const total = src.getPageCount();
+  const per = Math.ceil(total / parts);
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < total; i += per) {
+    const doc = await PDFDocument.create();
+    const idxs = Array.from(
+      { length: Math.min(per, total - i) },
+      (_, k) => i + k
+    );
+    const pages = await doc.copyPages(src, idxs);
+    pages.forEach((p) => doc.addPage(p));
+    out.push(await doc.save());
+  }
+  return out;
+}
 
 export default function Import() {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [progress, setProgress] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
@@ -44,67 +50,102 @@ export default function Import() {
     load();
   }, []);
 
+  async function createMaterialWithUnits(
+    uid: string,
+    title: string,
+    type: MaterialType,
+    bytes: Uint8Array | ArrayBuffer,
+    positionOffset: number
+  ): Promise<number> {
+    const blob = new Blob([bytes], { type: "application/pdf" });
+
+    const doc = await pdfjs.getDocument({
+      data: bytes instanceof Uint8Array ? bytes.slice() : bytes.slice(0),
+    }).promise;
+    const pageCount = doc.numPages;
+
+    const path = `${uid}/${type}-${Date.now()}-${Math.round(Math.random() * 1e6)}.pdf`;
+    const up = await supabase.storage.from("materials").upload(path, blob, {
+      contentType: "application/pdf",
+    });
+    if (up.error) throw up.error;
+
+    const mat = await supabase
+      .from("materials")
+      .insert({
+        user_id: uid,
+        title,
+        type,
+        file_path: path,
+        page_count: pageCount,
+      })
+      .select()
+      .single();
+    if (mat.error) throw mat.error;
+
+    const units: Partial<Unit>[] = [];
+    for (let p = 1; p <= pageCount; p++) {
+      units.push({
+        user_id: uid,
+        material_id: (mat.data as Material).id,
+        page_start: p,
+        page_end: p,
+        title: `${title} — pág. ${p}`,
+        kind: type,
+        level: "intermediate",
+        position: positionOffset + p - 1,
+      });
+    }
+    const insUnits = await supabase.from("units").insert(units);
+    if (insUnits.error) throw insUnits.error;
+
+    return pageCount;
+  }
+
   async function handleFile(slot: (typeof EXPECTED)[number], file: File) {
     setBusy(slot.title);
     setError(null);
+    setProgress("");
     try {
       const { data: userData } = await supabase.auth.getUser();
       const uid = userData.user!.id;
-
-      // 1. contar páginas
       const buf = await file.arrayBuffer();
-      const doc = await pdfjs.getDocument({ data: buf }).promise;
-      const pageCount = doc.numPages;
 
-      // 2. upload
-      const path = `${uid}/${slot.type}-${Date.now()}.pdf`;
-      const up = await supabase.storage.from("materials").upload(path, file, {
-        contentType: "application/pdf",
-      });
-      if (up.error) throw up.error;
-
-      // 3. material
-      const mat = await supabase
-        .from("materials")
-        .insert({
-          user_id: uid,
-          title: slot.title,
-          type: slot.type,
-          file_path: path,
-          page_count: pageCount,
-        })
-        .select()
-        .single();
-      if (mat.error) throw mat.error;
-
-      // 4. unidades (1 página = 1 unidade por padrão)
-      const per = PAGES_PER_UNIT[slot.type];
-      const units: Partial<Unit>[] = [];
-      let pos = 0;
-      for (let p = 1; p <= pageCount; p += per) {
-        units.push({
-          user_id: uid,
-          material_id: (mat.data as Material).id,
-          page_start: p,
-          page_end: Math.min(p + per - 1, pageCount),
-          title: `${slot.title} — pág. ${p}`,
-          kind: slot.type,
-          level: LEVEL_BY_TYPE[slot.type],
-          position: pos++,
-        });
+      if (file.size <= MAX_CHUNK_BYTES) {
+        setProgress("Enviando…");
+        await createMaterialWithUnits(uid, slot.title, slot.type, buf, 0);
+      } else {
+        // arquivo grande: dividir em partes < 40 MB
+        const parts = Math.ceil(file.size / MAX_CHUNK_BYTES);
+        setProgress(`Arquivo grande — dividindo em ${parts} partes…`);
+        const chunks = await splitPdf(buf, parts);
+        let offset = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          setProgress(`Enviando parte ${i + 1}/${chunks.length}…`);
+          const title = `${slot.title} (${i + 1}/${chunks.length})`;
+          const pages = await createMaterialWithUnits(
+            uid,
+            title,
+            slot.type,
+            chunks[i],
+            offset
+          );
+          offset += pages;
+        }
       }
-      const insUnits = await supabase.from("units").insert(units);
-      if (insUnits.error) throw insUnits.error;
 
       await load();
     } catch (e: any) {
       setError(e.message ?? String(e));
     } finally {
       setBusy(null);
+      setProgress("");
     }
   }
 
-  const importedTitles = new Set(materials.map((m) => m.title));
+  const importedBase = new Set(
+    materials.map((m) => m.title.replace(/ \(\d+\/\d+\)$/, ""))
+  );
 
   return (
     <div>
@@ -112,6 +153,7 @@ export default function Import() {
       <p className="mt-1 text-sm text-slate-500">
         Importe cada PDF uma única vez. O sistema divide tudo em unidades de estudo
         automaticamente — depois disso você nunca mais precisa abrir os arquivos.
+        Arquivos muito grandes são divididos em partes sozinhos.
       </p>
 
       {error && (
@@ -122,8 +164,11 @@ export default function Import() {
 
       <div className="mt-6 grid gap-3">
         {EXPECTED.map((slot) => {
-          const done = importedTitles.has(slot.title);
+          const done = importedBase.has(slot.title);
           const loading = busy === slot.title;
+          const pages = materials
+            .filter((m) => m.title.replace(/ \(\d+\/\d+\)$/, "") === slot.title)
+            .reduce((acc, m) => acc + (m.page_count ?? 0), 0);
           return (
             <div
               key={slot.title}
@@ -133,10 +178,8 @@ export default function Import() {
                 <div className="font-medium">{slot.title}</div>
                 <div className="text-xs text-slate-400">
                   {MATERIAL_TYPE_LABEL[slot.type]}
-                  {done &&
-                    ` · ${
-                      materials.find((m) => m.title === slot.title)?.page_count ?? "?"
-                    } páginas importadas`}
+                  {done && ` · ${pages} páginas importadas`}
+                  {loading && progress && ` · ${progress}`}
                 </div>
               </div>
 
@@ -170,9 +213,8 @@ export default function Import() {
       </div>
 
       <p className="mt-6 text-xs text-slate-400">
-        Dica: o arquivo "parte 01" e "parte 02" são os mapas mentais. Os nomes dos seus
-        arquivos não precisam bater — o que importa é escolher o PDF certo para cada
-        linha.
+        Dica: "parte 01" e "parte 02" são os mapas mentais. Os nomes dos seus arquivos
+        não precisam bater — o que importa é escolher o PDF certo para cada linha.
       </p>
     </div>
   );
