@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #eef7ff;
+  --color-brand-100: #d9edff;
+  --color-brand-200: #bcdeff;
+  --color-brand-300: #8ec7ff;
+  --color-brand-400: #59a7fc;
+  --color-brand-500: #2f7cf6;
+  --color-brand-600: #1f63d6;
+  --color-brand-700: #1a51ae;
+  --color-ink-900: #0f172a;
+  --color-ink-700: #334155;
+  --color-ink-500: #64748b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+.react-pdf__Page__canvas {
+  margin: 0 auto;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgb(0 0 0 / 0.08);
+}
