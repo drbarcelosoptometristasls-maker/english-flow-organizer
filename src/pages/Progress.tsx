@@ -17,6 +17,33 @@ export default function Progress({ profile }: { profile: Profile | null }) {
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [learned, setLearned] = useState(0);
   const [totalUnits, setTotalUnits] = useState(0);
+  const [resetting, setResetting] = useState(false);
+
+  async function resetProgress() {
+    if (
+      !window.confirm(
+        "Zerar TODO o progresso (planos, revisões, marcações, histórico e streak)? Materiais, assuntos e marcações de capa são mantidos."
+      )
+    )
+      return;
+    setResetting(true);
+    const { data: userData } = await supabase.auth.getUser();
+    const uid = userData.user!.id;
+    await supabase.from("activity_logs").delete().eq("user_id", uid);
+    await supabase.from("reviews").delete().eq("user_id", uid);
+    await supabase
+      .from("unit_status")
+      .delete()
+      .eq("user_id", uid)
+      .neq("status", "skipped"); // capas/ignoradas são preservadas
+    await supabase.from("daily_plans").delete().eq("user_id", uid);
+    await supabase
+      .from("profiles")
+      .update({ streak_current: 0, streak_best: 0 })
+      .eq("id", uid);
+    setResetting(false);
+    window.location.href = "/";
+  }
 
   useEffect(() => {
     (async () => {
@@ -79,6 +106,21 @@ export default function Progress({ profile }: { profile: Profile | null }) {
             />
           ))}
         </div>
+      </div>
+
+      <div className="mt-8 rounded-2xl border border-red-100 bg-red-50/50 p-6">
+        <h2 className="font-semibold text-red-700">Zona de teste</h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Zera planos diários, revisões, marcações e histórico. Materiais
+          importados, assuntos e marcações de capa são mantidos.
+        </p>
+        <button
+          onClick={resetProgress}
+          disabled={resetting}
+          className="mt-3 rounded-lg border border-red-200 bg-white px-4 py-2 text-sm font-semibold text-red-600 hover:bg-red-50 disabled:opacity-50"
+        >
+          {resetting ? "Zerando…" : "Zerar todo o progresso"}
+        </button>
       </div>
 
       <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-6">
